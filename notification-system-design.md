@@ -226,4 +226,173 @@ ws.onmessage = (event) => {
 '''
 ## Stage 2: Database Design
 
-#Choice: Postman
+##Choice: Postman
+
+### Schema
+
+#### Students Table
+'''sql
+CREATE TABLE students (
+    id SERIAL PRIMARY KEY,
+    roll_no VARCHAR(20) UNIQUE NOT NULL,
+    name VARCHAR(100) NOT NULL,
+    email VARCHAR(100) UNIQUE NOT NULL,
+    mobile VARCHAR(15),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+'''
+
+#### Notifications Table
+'''sql
+CREATE TABLE notifications (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    student_id INTEGER REFERENCES students(id) ON DELETE CASCADE,
+    type VARCHAR(20) NOT NULL CHECK (type IN ('Event', 'Result', 'Placement')),
+    message TEXT NOT NULL,
+    is_read BOOLEAN DEFAULT FALSE,
+    priority INTEGER DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    sent_at TIMESTAMP
+);
+'''
+
+### Indexes
+'''sql
+CREATE INDEX idx_notifications_student_read ON notifications(student_id, is_read);
+CREATE INDEX idx_notifications_created_at ON notifications(created_at);
+CREATE INDEX idx_notifications_type ON notifications(type);
+'''
+
+### Sample Queries
+'''sql
+-- Get unread notifications
+SELECT * FROM notifications
+WHERE student_id = 1042 AND is_read = FALSE
+ORDER BY created_at ASC
+LIMIT 100;
+
+-- Get priority notifications
+SELECT * FROM notifications
+WHERE student_id = 1042 AND is_read = FALSE
+ORDER BY 
+    CASE type 
+        WHEN 'Placement' THEN 1
+        WHEN 'Result' THEN 2
+        WHEN 'Event' THEN 3
+    END ASC
+LIMIT 10;
+'''
+---
+---
+
+## Stage 3: Query Optimization
+
+### Problem Query
+'''sql
+SELECT * FROM notifications
+WHERE studentID = 1042 AND isRead = false
+ORDER BY createdAt ASC;
+'''
+
+### Why is it slow?
+1. **No proper index** - Full table scan on 5M+ records
+2. **SELECT \*** - Retrieves all columns unnecessarily
+3. **ORDER BY** - Requires sorting entire result set
+
+### Optimized Solution
+'''sql
+-- Create composite index
+CREATE INDEX idx_notifications_student_read_created 
+ON notifications(student_id, is_read, created_at);
+
+-- Optimized query
+SELECT id, type, message, created_at
+FROM notifications
+WHERE student_id = 1042 AND is_read = false
+ORDER BY created_at ASC
+LIMIT 100;
+'''
+
+### Indexing Advice
+> **"Don't index every column!"** - Indexes slow down INSERT/UPDATE/DELETE operations
+
+### Computation Cost Comparison
+| Scenario | Time |
+|----------|------|
+| Before Index | 5-10 seconds |
+| After Index | <100ms |
+
+---
+
+## Stage 4: Caching Strategy
+
+### Problem
+- 50,000 students fetch notifications on every page load
+- Database overwhelmed → Slow response times
+
+### Solution: Multi-Layer Caching
+
+#### 1. Redis Cache (Server-Side)
+'''javascript
+const cacheKey = `unread:${studentId}`;
+let unreadCount = await redis.get(cacheKey);
+
+if (!unreadCount) {
+    unreadCount = await db.query('SELECT COUNT(*) FROM notifications WHERE student_id = ? AND is_read = false', [studentId]);
+    await redis.setex(cacheKey, 300, unreadCount); // 5 minutes TTL
+}
+'''
+
+#### 2. Local Storage (Frontend)
+'''javascript
+const cached = localStorage.getItem(`notifications:${studentId}`);
+if (cached && Date.now() - JSON.parse(cached).timestamp < 60000) {
+    return JSON.parse(cached).data;
+}
+'''
+
+### Tradeoffs
+| Strategy | Pros | Cons |
+|----------|------|------|
+| Redis | Fast, shared | Memory cost |
+| Local Storage | Zero server load | 5-10MB limit |
+| Service Worker | Offline support | Complex setup |
+
+---
+
+## Stage 5: Async Processing
+
+### Problem with Original Implementation
+'''python
+function notify_all(student_ids: array, message: string):
+    for student_id in student_ids:
+        save_to_db(student_id, message)
+        send_email(student_id, message)
+'''
+
+### Issues
+1. **Synchronous** - Blocks until complete
+2. **No retry** - Failed emails = lost notifications
+3. **No transaction** - DB saved but email failed
+
+### Improved Design with Message Queue
+'''python
+def notify_all(student_ids: array, message: str):
+    # Batch insert to DB
+    db.bulk_insert(notifications)
+    
+    # Publish to message queue
+    queue.publish_batch(student_ids, message)
+    return {"status": "queued"}
+
+# Worker (Async)
+def notification_worker():
+    for item in queue.consume():
+        try:
+            send_email(item.student_id, item.message)
+        except Exception as e:
+            if item.retry_count < 3:
+                queue.retry(item, delay=exponential_backoff())
+'''
+
+
